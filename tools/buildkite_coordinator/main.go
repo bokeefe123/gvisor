@@ -23,14 +23,17 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"maps"
 	"net/http"
 	"os"
 	"os/signal"
+	"slices"
 	"strings"
 	"syscall"
 	"time"
 
 	compute "google.golang.org/api/compute/v1"
+	yaml "gopkg.in/yaml.v3"
 	"gvisor.dev/gvisor/pkg/cleanup"
 )
 
@@ -38,6 +41,10 @@ const (
 	clearCacheInterval             = 4 * time.Hour
 	buildkiteCleanupJobsInterval   = 3 * time.Second
 	buildkiteReplenishJobsInterval = 10 * time.Second
+	trustedAuthorsRefreshInterval  = 10 * time.Minute
+
+	// trustedAuthorsRefreshTimeout bounds refreshing the trusted authors.
+	trustedAuthorsRefreshTimeout = time.Minute
 
 	// buildkiteListMaxJobs is how many scheduled jobs are considered per
 	// queue on each refresh.
@@ -67,6 +74,8 @@ type server struct {
 	rc *RateLimitController
 	// artifactTokenController is safe for concurrent use.
 	artifactTokenController *BucketTokenController
+	// gh is safe for concurrent use.
+	gh *githubClient
 
 	// pool is safe for concurrent use.
 	pool *JobPool
@@ -104,13 +113,7 @@ func newServer(ctx context.Context) *server {
 	}
 
 	// GitHub client
-	ghClient := newGitHubClient(ghToken)
-
-	// Create the Buildkite stack
-	stack, err := NewStack(ctx, cfg.stackKey, bkToken, ghClient, cfg.queues)
-	if err != nil {
-		log.Fatalf("Failed to create Buildkite stack: %v", err)
-	}
+	ghClient := newGitHubClient(ghToken, cfg.githubRepo)
 
 	// Create the instance timeout controller
 	tc, err := NewTimeoutController(ctx, computeSvc, cfg.project, cfg.agentServiceAccount)
@@ -130,6 +133,23 @@ func newServer(ctx context.Context) *server {
 		log.Fatalf("Failed to create artifact token issuer: %v", err)
 	}
 
+	// Fetch the maintainers list. Note that this will also be refreshed
+	// periodically while the server is running.
+	trustedAuthors, err := fetchTrustedAuthors(ctx, &cfg, ghClient)
+	if err != nil {
+		log.Fatalf("Failed to fetch trusted authors: %v", err)
+	}
+	log.Printf("Starting with trusted authors set: %v", slices.Collect(maps.Keys(trustedAuthors)))
+
+	// Create the job pool
+	pool := NewJobPool(reservedJobsPerBuild, cfg.queues, trustedAuthors)
+
+	// Create the Buildkite stack
+	stack, err := NewStack(ctx, cfg.stackKey, bkToken, ghClient, cfg.queues)
+	if err != nil {
+		log.Fatalf("Failed to create Buildkite stack: %v", err)
+	}
+
 	return &server{
 		cfg:                     cfg,
 		computeSvc:              computeSvc,
@@ -137,7 +157,8 @@ func newServer(ctx context.Context) *server {
 		tc:                      tc,
 		rc:                      rc,
 		artifactTokenController: artifactTokenController,
-		pool:                    NewJobPool(reservedJobsPerBuild, cfg.queues, cfg.trustedAuthors),
+		gh:                      ghClient,
+		pool:                    pool,
 	}
 }
 
@@ -342,6 +363,53 @@ func (s *server) runBuildkiteReplenishJobsTicker(ctx context.Context) {
 	}
 }
 
+func (s *server) runTrustedAuthorsTicker(ctx context.Context) {
+	ticker := time.Tick(trustedAuthorsRefreshInterval)
+	for {
+		<-ticker
+		trustedAuthors, err := fetchTrustedAuthors(ctx, &s.cfg, s.gh)
+		if err != nil {
+			log.Printf("Failed to refresh trusted authors: %v", err)
+			continue
+		}
+		s.pool.setTrustedAuthors(trustedAuthors)
+		log.Printf("New trusted authors set: %v", slices.Collect(maps.Keys(trustedAuthors)))
+	}
+}
+
+func fetchTrustedAuthors(ctx context.Context, cfg *config, gh *githubClient) (map[authorID]struct{}, error) {
+	ctx, cancel := context.WithTimeout(ctx, trustedAuthorsRefreshTimeout)
+	defer cancel()
+
+	data, err := gh.fileContents(ctx, cfg.maintainersFile)
+	if err != nil {
+		return nil, err
+	}
+	var file struct {
+		Maintainers []struct {
+			GitHub string `yaml:"github"`
+			Status string `yaml:"status"`
+		} `yaml:"maintainers"`
+	}
+	if err := yaml.Unmarshal(data, &file); err != nil {
+		return nil, fmt.Errorf("failed to parse %v: %w", cfg.maintainersFile, err)
+	}
+	trustedAuthors := maps.Clone(cfg.trustedAuthors)
+	for _, m := range file.Maintainers {
+		// Trust builds from ACTIVE and HIATUS maintainers
+		if m.Status != "ACTIVE" && !strings.HasPrefix(m.Status, "HIATUS_SINCE:") {
+			continue
+		}
+		// Fetch the GitHub login's user ID
+		id, err := gh.userID(ctx, m.GitHub)
+		if err != nil {
+			return nil, err
+		}
+		trustedAuthors[id] = struct{}{}
+	}
+	return trustedAuthors, nil
+}
+
 func main() {
 	ctx := context.Background()
 	s := newServer(ctx)
@@ -359,6 +427,7 @@ func main() {
 	go s.runClearCacheTicker()
 	go s.runBuildkiteCleanupJobsTicker(ctx)
 	go s.runBuildkiteReplenishJobsTicker(ctx)
+	go s.runTrustedAuthorsTicker(ctx)
 
 	// When the coordinator VM shuts down, SIGTERM is sent
 	notifyContext, stop := signal.NotifyContext(ctx, syscall.SIGTERM, os.Interrupt)

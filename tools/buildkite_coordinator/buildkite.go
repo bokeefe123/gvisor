@@ -23,6 +23,7 @@ import (
 	"slices"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	compute "google.golang.org/api/compute/v1"
@@ -145,8 +146,8 @@ type JobPool struct {
 	jobsPerBuild uint
 
 	// trustedAuthors lists author IDs whose builds will be placed in trustedBuilds.
-	// It is immutable.
-	trustedAuthors map[authorID]struct{}
+	// Writing to trustedAuthors is protected by mu.
+	trustedAuthors atomic.Pointer[map[authorID]struct{}]
 
 	// mu protects queues.
 	mu sync.Mutex
@@ -159,10 +160,10 @@ type JobPool struct {
 // NewJobPool returns an empty job pool.
 func NewJobPool(jobsPerBuild uint, queues map[string]struct{}, trustedAuthors map[authorID]struct{}) *JobPool {
 	p := &JobPool{
-		jobsPerBuild:   jobsPerBuild,
-		trustedAuthors: trustedAuthors,
-		queues:         make(map[string]Queue),
+		jobsPerBuild: jobsPerBuild,
+		queues:       make(map[string]Queue),
 	}
+	p.trustedAuthors.Store(&trustedAuthors)
 	for queue := range queues {
 		p.queues[queue] = Queue{
 			untrustedBuilds: make(map[BuildUUID]Build),
@@ -170,6 +171,15 @@ func NewJobPool(jobsPerBuild uint, queues map[string]struct{}, trustedAuthors ma
 		}
 	}
 	return p
+}
+
+// setTrustedAuthors replaces the set of trusted authors.
+//
+// (It doesn't affect the builds already in the pool.)
+func (p *JobPool) setTrustedAuthors(trustedAuthors map[authorID]struct{}) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.trustedAuthors.Store(&trustedAuthors)
 }
 
 // countLocked returns how many jobs from the given build on the given queue are in
@@ -246,7 +256,7 @@ func (p *JobPool) trusted(metadata BuildMetadata) bool {
 			return false
 		}
 		// Otherwise, check if the author is in the trusted authors set
-		_, ok := p.trustedAuthors[metadata.author]
+		_, ok := (*p.trustedAuthors.Load())[metadata.author]
 		return ok
 
 	default:
